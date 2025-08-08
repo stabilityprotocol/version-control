@@ -331,7 +331,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🚀 Roadmap
 
-- [ ] **Multi-chain support** (Ethereum, Polygon)
 - [ ] **Web dashboard** for commit visualization
 - [ ] **Team collaboration** features
 - [ ] **Git LFS integration** for large files
