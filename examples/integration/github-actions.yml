@@ -1,0 +1,93 @@
+# Example GitHub Actions workflow for Stability Blockchain Version Control
+# Add this to your repository: .github/workflows/blockchain-verification.yml
+
+name: Blockchain Version Control
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  setup-blockchain-vc:
+    runs-on: ubuntu-latest
+    name: Setup Blockchain Version Control
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Stability Blockchain VC
+        run: |
+          # Download and install latest version
+          curl -L https://github.com/your-username/stability-blockchain-version-control/archive/main.tar.gz | tar xz
+          cd stability-blockchain-version-control-main
+
+          # Configure for CI environment
+          cp examples/config-templates/testnet-config.sh config/stability-config.sh
+
+          # Install Git hook
+          bash scripts/install-hook.sh << EOF
+          testnet
+
+          GitHub Actions Project
+
+          EOF
+
+      - name: Set up Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Test blockchain integration
+        run: |
+          # Make a test commit to verify blockchain integration
+          echo "# CI Test $(date)" >> CI-TEST.md
+          git add CI-TEST.md
+          git commit -m "ci: blockchain verification test"
+
+          # Check that blockchain submission was attempted
+          cat logs/stability-hook.log | grep -E "(Successfully submitted|blockchain)"
+
+      - name: Verify commit on blockchain
+        run: |
+          # Optional: Add verification step
+          # This would query the blockchain to confirm commit storage
+          echo "Blockchain verification would happen here"
+
+      - name: Upload logs
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: blockchain-logs
+          path: logs/stability-hook.log
+
+  # Example for production deployment
+  deploy-with-blockchain:
+    runs-on: ubuntu-latest
+    name: Deploy with Blockchain Verification
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup production blockchain config
+        run: |
+          # Use production configuration
+          cp examples/config-templates/mainnet-config.sh config/stability-config.sh
+
+          # Set production API key from secrets
+          sed -i "s/export STABILITY_API_KEY=\"\"/export STABILITY_API_KEY=\"${{ secrets.STABILITY_API_KEY }}\"/g" config/stability-config.sh
+
+      - name: Deploy application
+        run: |
+          # Your deployment steps here
+          echo "Deploying application..."
+
+          # Commits made during deployment will be blockchain-verified
+          git add .
+          git commit -m "deploy: production release $(date)" || echo "No changes to commit"
+
+      - name: Verify deployment on blockchain
+        run: |
+          # Verify that deployment commit is recorded on blockchain
+          bash scripts/verify-commits.sh $(git rev-parse HEAD)

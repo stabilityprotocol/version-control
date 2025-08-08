@@ -1,0 +1,197 @@
+#!/bin/bash
+
+# -------------------------------------------
+# Stability Blockchain Git Hook (post-commit)
+# Version: 1.0.0
+# -------------------------------------------
+
+# Set strict error handling
+set -euo pipefail
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/../config/stability-config.sh"
+LOG_FILE="$SCRIPT_DIR/../logs/stability-hook.log"
+
+# Stability ZKT API Configuration
+DEFAULT_ZKT_ENDPOINT_MAINNET="https://rpc.stabilityprotocol.com/zkt"
+DEFAULT_ZKT_ENDPOINT_TESTNET="https://rpc.testnet.stabilityprotocol.com/zkt"
+DEFAULT_CONTRACT_ADDRESS="0x0000000000000000000000000000000000000000"  # To be deployed
+
+# Ensure log directory exists
+mkdir -p "$(dirname "$LOG_FILE")"
+
+# Function to log messages with timestamp
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+# Function to log errors
+log_error() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" | tee -a "$LOG_FILE" >&2
+}
+
+# Function to check if command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Load configuration
+if [[ -f "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+    log "Loaded configuration from $CONFIG_FILE"
+else
+    log_error "Configuration file not found: $CONFIG_FILE"
+    log_error "Please run the setup script or create configuration manually"
+    exit 1
+fi
+
+# Validate required configuration
+if [[ -z "${STABILITY_ZKT_ENDPOINT:-}" ]]; then
+    log_error "STABILITY_ZKT_ENDPOINT not configured - using default testnet"
+    STABILITY_ZKT_ENDPOINT="$DEFAULT_ZKT_ENDPOINT_TESTNET"
+fi
+
+# API key is optional for public endpoint, required for private
+if [[ -z "${STABILITY_API_KEY:-}" ]]; then
+    log "No API key configured - using public ZKT endpoint"
+    USE_PUBLIC_ENDPOINT="true"
+else
+    log "API key configured - using authenticated ZKT endpoint"
+    USE_PUBLIC_ENDPOINT="false"
+fi
+
+# Check required commands
+if ! command_exists git; then
+    log_error "Git is not installed or not in PATH"
+    exit 1
+fi
+
+if ! command_exists curl; then
+    log_error "curl is not installed or not in PATH"
+    exit 1
+fi
+
+# Check for sha256sum (Linux) or use shasum -a 256 (macOS)
+if command_exists sha256sum; then
+    HASH_COMMAND="sha256sum"
+elif command_exists shasum; then
+    HASH_COMMAND="shasum -a 256"
+elif command_exists gsha256sum; then
+    HASH_COMMAND="gsha256sum"
+else
+    log_error "No SHA-256 command found. Please install coreutils or ensure shasum is available"
+    exit 1
+fi
+
+log "🟢 Starting Stability blockchain commit hook..."
+
+# Generate commit metadata
+log "🟢 Generating commit metadata..."
+COMMIT_HASH=$(git rev-parse HEAD)
+AUTHOR=$(git log -1 --pretty=format:'%an')
+AUTHOR_EMAIL=$(git log -1 --pretty=format:'%ae')
+COMMIT_MESSAGE=$(git log -1 --pretty=format:'%s')
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+log "Commit Hash: $COMMIT_HASH"
+log "Author: $AUTHOR <$AUTHOR_EMAIL>"
+log "Branch: $BRANCH"
+log "Timestamp: $TIMESTAMP"
+
+# Generate SHA-256 hash of entire codebase
+log "🟢 Generating SHA-256 hash of the entire codebase..."
+CODEBASE_HASH=$(git archive HEAD | $HASH_COMMAND | awk '{print $1}')
+
+if [[ -z "$CODEBASE_HASH" ]]; then
+    log_error "Failed to generate codebase hash"
+    exit 1
+fi
+
+log "Codebase Hash: $CODEBASE_HASH"
+
+# Determine ZKT endpoint based on configuration
+if [[ "$USE_PUBLIC_ENDPOINT" == "true" ]]; then
+    ZKT_URL="$STABILITY_ZKT_ENDPOINT/try-it-out"
+else
+    ZKT_URL="$STABILITY_ZKT_ENDPOINT/$STABILITY_API_KEY"
+fi
+
+# Create ZKT payload for smart contract interaction
+# First, we'll store a simple message, then later implement smart contract
+if [[ -n "${STABILITY_CONTRACT_ADDRESS:-}" && "$STABILITY_CONTRACT_ADDRESS" != "0x0000000000000000000000000000000000000000" ]]; then
+    # Smart contract interaction format
+    read -r -d '' PAYLOAD << EOF || true
+{
+  "abi": [
+    "function storeCommit(string commitHash, string codebaseHash, string author, string authorEmail, string branch, string message, string projectName)",
+    "function getCommit(string commitHash) view returns (tuple(string codebaseHash, string author, string message, uint256 timestamp, address submitter))"
+  ],
+  "to": "$STABILITY_CONTRACT_ADDRESS",
+  "method": "storeCommit",
+  "arguments": [
+    "$COMMIT_HASH",
+    "$CODEBASE_HASH", 
+    "$AUTHOR",
+    "$AUTHOR_EMAIL",
+    "$BRANCH",
+    "$COMMIT_MESSAGE",
+    "${PROJECT_NAME:-Stability VC Project}"
+  ],
+  "id": "$(echo $COMMIT_HASH | cut -c1-8)"
+}
+EOF
+else
+    # Simple message format for initial implementation
+    COMMIT_DATA="CommitHash:$COMMIT_HASH|CodebaseHash:$CODEBASE_HASH|Author:$AUTHOR|Branch:$BRANCH|Timestamp:$TIMESTAMP|Message:$COMMIT_MESSAGE"
+    read -r -d '' PAYLOAD << EOF || true
+{
+  "arguments": "$COMMIT_DATA"
+}
+EOF
+fi
+
+log "🟢 ZKT payload prepared for blockchain submission"
+
+# Submit to Stability Blockchain via ZKT
+log "🟢 Submitting to Stability ZKT API..."
+log "ZKT URL: $ZKT_URL"
+
+# Build curl command based on endpoint type
+if [[ "$USE_PUBLIC_ENDPOINT" == "true" ]]; then
+    HTTP_STATUS=$(curl -s -o "$LOG_FILE.response" -w "%{http_code}" \
+        -X POST "$ZKT_URL" \
+        -H "Content-Type: application/json" \
+        -H "User-Agent: Stability-VC-Hook/1.0.0" \
+        -d "$PAYLOAD")
+else
+    HTTP_STATUS=$(curl -s -o "$LOG_FILE.response" -w "%{http_code}" \
+        -X POST "$ZKT_URL" \
+        -H "Content-Type: application/json" \
+        -H "User-Agent: Stability-VC-Hook/1.0.0" \
+        -d "$PAYLOAD")
+fi
+
+# Check response
+if [[ "$HTTP_STATUS" -ge 200 && "$HTTP_STATUS" -lt 300 ]]; then
+    log "✅ Successfully submitted to blockchain (HTTP $HTTP_STATUS)"
+    RESPONSE=$(cat "$LOG_FILE.response")
+    log "API Response: $RESPONSE"
+    
+    # Clean up response file
+    rm -f "$LOG_FILE.response"
+else
+    log_error "Failed to submit to blockchain (HTTP $HTTP_STATUS)"
+    if [[ -f "$LOG_FILE.response" ]]; then
+        RESPONSE=$(cat "$LOG_FILE.response")
+        log_error "API Response: $RESPONSE"
+        rm -f "$LOG_FILE.response"
+    fi
+    
+    # Don't fail the commit, just log the error
+    log_error "Commit succeeded but blockchain submission failed"
+    exit 0
+fi
+
+log "🟢 Stability blockchain hook completed successfully"

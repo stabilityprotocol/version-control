@@ -1,0 +1,238 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  validate-release:
+    runs-on: ubuntu-latest
+    name: Validate Release
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate tag format
+        id: version
+        run: |
+          tag=${GITHUB_REF#refs/tags/}
+          echo "Processing tag: $tag"
+
+          # Validate semantic version format
+          if [[ ! $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ ! $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+-[a-zA-Z0-9]+$ ]]; then
+            echo "Invalid tag format: $tag"
+            exit 1
+          fi
+
+          version=${tag#v}
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+          # Check if this is a prerelease
+          if [[ $tag =~ -[a-zA-Z0-9]+$ ]]; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check CHANGELOG
+        run: |
+          version=${{ steps.version.outputs.version }}
+          if ! grep -q "## \[$version\]" CHANGELOG.md; then
+            echo "Version $version not found in CHANGELOG.md"
+            exit 1
+          fi
+          echo "CHANGELOG.md updated for version $version"
+
+  test-before-release:
+    needs: validate-release
+    runs-on: ubuntu-latest
+    name: Test Before Release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Git
+        run: |
+          git config --global user.name "Release Bot"
+          git config --global user.email "release@github.com"
+
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh hooks/post-commit
+
+      - name: Run comprehensive tests
+        run: |
+          # Run all critical tests before release
+          bash scripts/quick-test.sh
+
+          # Test script permissions
+          find scripts/ -name "*.sh" -type f ! -executable -exec echo "Missing execute permission: {}" \; -exec exit 1 \;
+
+          # Test hook permissions
+          test -x hooks/post-commit || (echo "Hook not executable" && exit 1)
+
+          echo "All tests passed for release"
+
+  create-release:
+    needs: [validate-release, test-before-release]
+    runs-on: ubuntu-latest
+    name: Create GitHub Release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Need full history for changelog
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          version=${{ needs.validate-release.outputs.version }}
+
+          # Extract changelog for this version
+          awk "/## \[$version\]/ {found=1; next} /## \[/ {if(found) exit} found" CHANGELOG.md > release_notes.md
+
+          # Add header
+          echo "# Stability Blockchain Version Control v$version" > full_release_notes.md
+          echo "" >> full_release_notes.md
+          cat release_notes.md >> full_release_notes.md
+
+          # Add quick start section
+          echo "" >> full_release_notes.md
+          echo "## 🚀 Quick Start" >> full_release_notes.md
+          echo "" >> full_release_notes.md
+          echo '```bash' >> full_release_notes.md
+          echo '# Clone and setup' >> full_release_notes.md
+          echo 'git clone https://github.com/${{ github.repository }}.git' >> full_release_notes.md
+          echo 'cd stability-blockchain-version-control' >> full_release_notes.md
+          echo '' >> full_release_notes.md
+          echo '# Install in your Git repository' >> full_release_notes.md
+          echo 'bash scripts/install-hook.sh' >> full_release_notes.md
+          echo '' >> full_release_notes.md
+          echo '# Start making blockchain-verified commits!' >> full_release_notes.md
+          echo 'git commit -m "My first blockchain commit"' >> full_release_notes.md
+          echo '```' >> full_release_notes.md
+
+          echo "release_notes_file=full_release_notes.md" >> $GITHUB_OUTPUT
+
+      - name: Create release assets
+        run: |
+          version=${{ needs.validate-release.outputs.version }}
+
+          # Create release archive
+          tar -czf stability-blockchain-vc-v$version.tar.gz \
+            --exclude='.git*' \
+            --exclude='*.log' \
+            --exclude='blockchain-vc-demo' \
+            --exclude='test-repo' \
+            .
+
+          # Create checksums
+          sha256sum stability-blockchain-vc-v$version.tar.gz > checksums.txt
+
+          # Create quick install script
+          cat > quick-install.sh << 'EOF'
+          #!/bin/bash
+          set -euo pipefail
+
+          echo "🚀 Installing Stability Blockchain Version Control..."
+
+          # Download and extract
+          curl -L https://github.com/${{ github.repository }}/archive/v${{ needs.validate-release.outputs.version }}.tar.gz | tar xz
+          cd stability-blockchain-version-control-${{ needs.validate-release.outputs.version }}
+
+          # Run installation
+          bash scripts/install-hook.sh
+
+          echo "✅ Installation complete!"
+          echo "Start making blockchain-verified commits with: git commit -m 'Your message'"
+          EOF
+
+          chmod +x quick-install.sh
+
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Stability Blockchain Version Control v${{ needs.validate-release.outputs.version }}
+          body_path: ${{ steps.release_notes.outputs.release_notes_file }}
+          draft: false
+          prerelease: ${{ needs.validate-release.outputs.prerelease }}
+
+      - name: Upload release assets
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./stability-blockchain-vc-v${{ needs.validate-release.outputs.version }}.tar.gz
+          asset_name: stability-blockchain-vc-v${{ needs.validate-release.outputs.version }}.tar.gz
+          asset_content_type: application/gzip
+
+      - name: Upload checksums
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./checksums.txt
+          asset_name: checksums.txt
+          asset_content_type: text/plain
+
+      - name: Upload quick install script
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./quick-install.sh
+          asset_name: quick-install.sh
+          asset_content_type: application/x-shellscript
+
+  update-docs:
+    needs: [validate-release, create-release]
+    runs-on: ubuntu-latest
+    name: Update Documentation
+    if: needs.validate-release.outputs.prerelease == 'false' # Only for stable releases
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update README badges
+        run: |
+          version=${{ needs.validate-release.outputs.version }}
+
+          # Update version badge in README
+          sed -i "s/version-v[0-9]\+\.[0-9]\+\.[0-9]\+/version-v$version/g" README.md
+
+          # Commit if changes were made
+          if git diff --quiet; then
+            echo "No README updates needed"
+          else
+            git config --local user.email "action@github.com"
+            git config --local user.name "GitHub Action"
+            git add README.md
+            git commit -m "docs: update version badge to v$version"
+            git push
+          fi
+
+  notify-community:
+    needs: [validate-release, create-release]
+    runs-on: ubuntu-latest
+    name: Notify Community
+    if: needs.validate-release.outputs.prerelease == 'false' # Only for stable releases
+    steps:
+      - name: Create Discord notification
+        run: |
+          # Placeholder for Discord webhook notification
+          echo "🎉 New release: v${{ needs.validate-release.outputs.version }}"
+          echo "Community notifications would be sent here"
+
+      - name: Update package registries
+        run: |
+          # Placeholder for package registry updates (npm, homebrew, etc.)
+          echo "📦 Package registry updates would be triggered here"
